@@ -21,7 +21,7 @@ from dataclasses import asdict, dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Union
 
 
 APP_NAME = "zprom"
@@ -44,6 +44,11 @@ SEVERITY_SCORES = {
     "critical": 2,
     "unknown": -1,
 }
+
+SIOCGIFADDR = 0x8915
+MAX_EVENTS_LIMIT = 5000
+DEFAULT_EVENTS_LIMIT = 100
+CONSOLE_REFRESH_INTERVAL = 5.0
 
 
 @dataclass(slots=True)
@@ -267,15 +272,16 @@ class MonitorConfig:
 
 
 class TextReader:
+
     @staticmethod
-    def read_text(path: str | Path) -> Optional[str]:
+    def read_text(path: Union[str, Path]) -> Optional[str]:
         try:
             return Path(path).read_text(encoding="utf-8").strip()
         except (FileNotFoundError, PermissionError, OSError, UnicodeDecodeError):
             return None
 
     @staticmethod
-    def read_int(path: str | Path) -> Optional[int]:
+    def read_int(path: Union[str, Path]) -> Optional[int]:
         value = TextReader.read_text(path)
         if value is None:
             return None
@@ -286,11 +292,13 @@ class TextReader:
 
 
 class SampleProvider:
+
     def collect(self, selected: Optional[Iterable[str]] = None) -> Dict[str, InterfaceSample]:
         raise NotImplementedError
 
 
 class LinuxNetReader(SampleProvider):
+
     def __init__(self) -> None:
         self.sys_net = Path("/sys/class/net")
         self.proc_net_dev = Path("/proc/net/dev")
@@ -298,6 +306,7 @@ class LinuxNetReader(SampleProvider):
         self._cached_interfaces: Optional[List[str]] = None
         self._cache_time: Optional[float] = None
         self._cache_ttl: float = 5.0
+        self._ipv4_socket: Optional[socket.socket] = None
 
     def list_interfaces(self, force_refresh: bool = False) -> List[str]:
         now = time.monotonic()
@@ -361,13 +370,14 @@ class LinuxNetReader(SampleProvider):
 
     def get_ipv4(self, iface: str) -> Optional[str]:
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                encoded = iface.encode("utf-8")
-                if len(encoded) > 15:
-                    return None
-                request = struct.pack("256s", encoded)
-                response = fcntl.ioctl(s.fileno(), 0x8915, request)
-                return socket.inet_ntoa(response[20:24])
+            if self._ipv4_socket is None:
+                self._ipv4_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            encoded = iface.encode("utf-8")
+            if len(encoded) > 15:
+                return None
+            request = struct.pack("256s", encoded)
+            response = fcntl.ioctl(self._ipv4_socket.fileno(), SIOCGIFADDR, request)
+            return socket.inet_ntoa(response[20:24])
         except OSError:
             return None
 
@@ -404,6 +414,7 @@ class LinuxNetReader(SampleProvider):
 
 
 class ReplayReader(SampleProvider):
+
     def __init__(self, path: str) -> None:
         self.path = Path(path)
         self.frames = self._load_frames()
@@ -412,8 +423,11 @@ class ReplayReader(SampleProvider):
     def _load_frames(self) -> List[Dict[str, Any]]:
         if not self.path.exists():
             raise FileNotFoundError(f"replay file not found: {self.path}")
-        text = self.path.read_text(encoding="utf-8")
-        data = json.loads(text)
+        try:
+            text = self.path.read_text(encoding="utf-8")
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"invalid JSON in replay file: {e}")
         if not isinstance(data, list):
             raise ValueError("replay file must contain a JSON array")
         return data
@@ -466,6 +480,7 @@ class ReplayReader(SampleProvider):
 
 
 class SelfTestReader(SampleProvider):
+
     def __init__(self, count: int, seed: int) -> None:
         self.rng = random.Random(seed)
         self.names = [f"sim{i}" for i in range(1, max(1, count) + 1)]
@@ -482,8 +497,8 @@ class SelfTestReader(SampleProvider):
                 continue
             c = self.counters[iface]
             burst = self.rng.random()
-            rx_step = self.rng.randint(20_000, 200_000)
-            tx_step = self.rng.randint(10_000, 140_000)
+            rx_step = self.rng.randint(20000, 200000)
+            tx_step = self.rng.randint(10000, 140000)
             if burst > 0.96:
                 rx_step *= self.rng.randint(10, 60)
                 tx_step *= self.rng.randint(10, 50)
@@ -533,6 +548,7 @@ class SelfTestReader(SampleProvider):
 
 
 class RateCalculator:
+
     @staticmethod
     def calculate(previous: Optional[InterfaceSample], current: InterfaceSample) -> InterfaceRates:
         if previous is None:
@@ -563,6 +579,7 @@ class RateCalculator:
 
 
 class EventStore:
+
     def __init__(self, jsonl_path: Optional[str], sqlite_path: Optional[str]) -> None:
         self.jsonl_path = jsonl_path
         self.sqlite_path = sqlite_path
@@ -655,6 +672,7 @@ class EventStore:
 
 
 class AnomalyEngine:
+
     def __init__(self, policy: ThresholdPolicy) -> None:
         self.policy = policy
         self._event_id = 0
@@ -878,6 +896,7 @@ class AnomalyEngine:
 
 
 class HealthEvaluator:
+
     @staticmethod
     def from_state(state: InterfaceState, now_wall: float) -> InterfaceHealth:
         score = 0
@@ -926,6 +945,7 @@ class HealthEvaluator:
 
 
 class PrometheusRenderer:
+
     @staticmethod
     def escape_label_value(value: Any) -> str:
         return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
@@ -947,7 +967,7 @@ class PrometheusRenderer:
         lines.append(f"{name}{label_part} {value}")
 
     @staticmethod
-    def render(state: "MonitorState") -> str:
+    def render(state: MonitorState) -> str:
         with state.lock:
             lines: List[str] = []
             lines.append("# HELP zprom_up Exporter health state")
@@ -1007,6 +1027,7 @@ class PrometheusRenderer:
 
 
 class MonitorState:
+
     def __init__(self, config: MonitorConfig, reader: SampleProvider) -> None:
         self.config = config
         self.started_wall = time.time()
@@ -1021,6 +1042,7 @@ class MonitorState:
         self.last_tick_wall: Optional[float] = None
         self.last_tick_mono: Optional[float] = None
         self.mode = self.mode_name()
+        self._removal_pending: List[str] = []
 
     def mode_name(self) -> str:
         if self.config.selftest_mode:
@@ -1244,7 +1266,8 @@ class MonitorState:
 
                 item.health = HealthEvaluator.from_state(item, sample.timestamp_wall)
 
-            to_remove = [iface for iface in self.interfaces if iface not in samples]
+            current_interfaces = set(samples.keys())
+            to_remove = [iface for iface in list(self.interfaces.keys()) if iface not in current_interfaces]
             for iface in to_remove:
                 del self.interfaces[iface]
 
@@ -1254,6 +1277,7 @@ class MonitorState:
 
 
 class MonitorWorker:
+
     def __init__(self, state: MonitorState) -> None:
         self.state = state
         self._stop = threading.Event()
@@ -1278,6 +1302,7 @@ class MonitorWorker:
                 self.state.update()
             except Exception:
                 logging.exception("monitor update failed")
+                time.sleep(1.0)
             elapsed = time.monotonic() - started
             remaining = interval - elapsed
             if remaining > 0:
@@ -1285,6 +1310,7 @@ class MonitorWorker:
 
 
 class JsonResponse:
+
     @staticmethod
     def send(handler: BaseHTTPRequestHandler, code: int, payload: Any) -> None:
         try:
@@ -1306,6 +1332,7 @@ class JsonResponse:
 
 
 class TextResponse:
+
     @staticmethod
     def send(handler: BaseHTTPRequestHandler, code: int, body: str, content_type: str) -> None:
         payload = body.encode("utf-8")
@@ -1317,6 +1344,7 @@ class TextResponse:
 
 
 class ApiHandler(BaseHTTPRequestHandler):
+
     state_ref: Optional[MonitorState] = None
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -1390,6 +1418,9 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         if len(segments) == 3 and segments[0] == "debug" and segments[1] == "interfaces":
             iface = urllib.parse.unquote(segments[2])
+            if ".." in iface or "/" in iface:
+                JsonResponse.send(self, HTTPStatus.BAD_REQUEST, {"error": "invalid interface name"})
+                return
             data = state.get_interface(iface)
             if data is None:
                 JsonResponse.send(self, HTTPStatus.NOT_FOUND, {"error": "interface not found", "iface": iface})
@@ -1400,12 +1431,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         if path == "/debug/events":
             iface = first(query.get("iface"))
             severity = first(query.get("severity"))
-            limit_raw = first(query.get("limit")) or "100"
+            limit_raw = first(query.get("limit")) or str(DEFAULT_EVENTS_LIMIT)
             try:
                 limit_val = int(limit_raw)
                 if limit_val <= 0:
-                    limit_val = 100
-                limit = max(1, min(limit_val, 5000))
+                    limit_val = DEFAULT_EVENTS_LIMIT
+                limit = max(1, min(limit_val, MAX_EVENTS_LIMIT))
             except ValueError:
                 JsonResponse.send(self, HTTPStatus.BAD_REQUEST, {"error": "invalid limit"})
                 return
@@ -1420,6 +1451,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 
 
 class ConsoleRenderer:
+
     @staticmethod
     def human_bytes_per_second(value: float) -> str:
         units = ["B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"]
@@ -1432,10 +1464,10 @@ class ConsoleRenderer:
 
     @staticmethod
     def human_pps(value: float) -> str:
-        if value >= 1_000_000:
-            return f"{value / 1_000_000:.2f} Mpps"
-        if value >= 1_000:
-            return f"{value / 1_000:.2f} Kpps"
+        if value >= 1000000:
+            return f"{value / 1000000:.2f} Mpps"
+        if value >= 1000:
+            return f"{value / 1000:.2f} Kpps"
         return f"{value:.2f} pps"
 
     @staticmethod
@@ -1487,8 +1519,11 @@ def load_config_from_file(path: Optional[str]) -> Dict[str, Any]:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"config not found: {path}")
-    text = p.read_text(encoding="utf-8")
-    data = json.loads(text)
+    try:
+        text = p.read_text(encoding="utf-8")
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"invalid JSON in config file: {e}")
     if not isinstance(data, dict):
         raise ValueError("config must be a JSON object")
     return data
@@ -1554,6 +1589,14 @@ def validate_positive_int(value: int, name: str) -> int:
     return value
 
 
+def validate_interface_name(name: str) -> bool:
+    if not name:
+        return False
+    if ".." in name or "/" in name or "\\" in name:
+        return False
+    return all(c.isalnum() or c in "-._" for c in name)
+
+
 def merge_config(args: argparse.Namespace, data: Dict[str, Any]) -> MonitorConfig:
     policy_data = data.get("policy", {}) if isinstance(data.get("policy"), dict) else {}
     policy = ThresholdPolicy(
@@ -1581,6 +1624,9 @@ def merge_config(args: argparse.Namespace, data: Dict[str, Any]) -> MonitorConfi
     elif not isinstance(include, list):
         raise ValueError("include must be a list")
     include = [str(item) for item in include]
+    for name in include:
+        if not validate_interface_name(name):
+            raise ValueError(f"invalid interface name: {name}")
 
     return MonitorConfig(
         interval=validate_positive_float(float(data.get("interval", args.interval)), "interval"),
@@ -1681,6 +1727,7 @@ def main() -> int:
 
     ApiHandler.state_ref = state
     server = ThreadingHTTPServer((config.bind_host, config.bind_port), ApiHandler)
+    server.allow_reuse_address = True
     server_thread = threading.Thread(target=server.serve_forever, name="api-server", daemon=True)
 
     worker.start()
@@ -1690,7 +1737,7 @@ def main() -> int:
     if config.debug_console:
         console_thread = threading.Thread(
             target=run_console_loop,
-            args=(state, stop, max(1.0, min(config.interval, 5.0))),
+            args=(state, stop, max(1.0, min(config.interval, CONSOLE_REFRESH_INTERVAL))),
             name="console-renderer",
             daemon=True,
         )
